@@ -1,0 +1,350 @@
+File: lib/dom-translator.ts
+Change: 修复 XSS 注入（移除 `insertAdjacentHTML` 直接拼接）、支持在 ShadowRoot 注入样式、`toggleStyle` 覆盖所有根、重复 host 清理、CSS 注入逻辑抽象
+
+```ts
+register(): void {
+  console.log('[DomTranslator] Registering');
+  this._ensureCssFor(document);
+  this._scanAll(document);
+  this._observeRoots();
+
+  if (this.rule.trigger === 'open') {
+    this.targetMap.forEach((_, node) => this._render(node));
+  }
+
+  if (this.rule.translateTitle) {
+    this._translateTitle();
+  }
+}
+```
+
+```ts
+toggleStyle(): void {
+  const next = this.rule.textStyle === 'fuzzy' ? 'dashline' : 'fuzzy';
+  this.rule.textStyle = next;
+  this.rootSet.forEach((root) => {
+    root.querySelectorAll(this.setting.hostTag).forEach((host) => {
+      (host as HTMLElement).setAttribute('data-style', next);
+    });
+  });
+}
+```
+
+```ts
+private _scanAll(root: Document | ShadowRoot): void {
+  this.rootSet.add(root);
+  this._ensureCssFor(root);
+
+  const targets = this._collectTargets(root, this.rule.selector);
+
+  targets.forEach(node => {
+    if (!this.targetMap.has(node)) {
+      this.targetMap.set(node, {});
+
+      if (this.rule.trigger === 'scroll') {
+        this._observeVisible(node);
+      } else if (this.rule.trigger === 'hover') {
+        this._bindHover(node);
+      }
+
+      if (this.rule.selectStyle) {
+        (node as HTMLElement).style.cssText += this.rule.selectStyle;
+      }
+      if (this.rule.parentStyle && node.parentElement) {
+        node.parentElement.style.cssText += this.rule.parentStyle;
+      }
+    }
+  });
+
+  root.querySelectorAll('*').forEach(el => {
+    if ((el as Element).shadowRoot) {
+      this._scanAll((el as Element).shadowRoot!);
+    }
+  });
+}
+```
+
+```ts
+private async _render(node: Element): Promise<void> {
+  // 清理所有旧的 host，避免重复渲染堆叠
+  node.querySelectorAll(this.setting.hostTag).forEach((h) => h.remove());
+
+  const cache = this.targetMap.get(node) || {};
+  const raw = (node as HTMLElement).innerText?.trim() || '';
+  if (!raw) return;
+
+  if (this.rule.displayMode === 'replace' && !cache.htmlBackup) {
+    cache.htmlBackup = node.innerHTML;
+  }
+
+  this.rule.onRenderStart?.(node, raw);
+
+  const { q, keeps } = this._buildPlaceholders(node);
+  const cleanLen = q.replace(/\[(\d+)\]/g, '').trim().length;
+  if (cleanLen < this.rule.minLen || cleanLen > this.rule.maxLen) {
+    return;
+  }
+
+  const host = document.createElement(this.setting.hostTag);
+  host.setAttribute('data-style', this.rule.textStyle);
+  node.appendChild(host);
+
+  const transId = Math.random().toString(36).slice(2, 10);
+  cache.lastId = transId;
+  this.targetMap.set(node, cache);
+
+  try {
+    const translatedText = await this.translate(q);
+    if (!translatedText) {
+      host.remove();
+      return;
+    }
+
+    if (this.targetMap.get(node)?.lastId !== transId) {
+      host.remove();
+      return;
+    }
+
+    const frag = this._buildFragmentFromTranslated(translatedText, keeps);
+
+    if (this.rule.displayMode === 'replace') {
+      // 直接替换目标节点内容，避免通过 innerHTML 注入
+      (node as HTMLElement).replaceChildren(frag);
+      host.remove();
+    } else {
+      // 覆盖模式渲染到 host
+      host.replaceChildren(frag);
+    }
+  } catch (err) {
+    console.warn('[DomTranslator] Translation failed:', err);
+    host.remove();
+  }
+}
+```
+
+```ts
+private _patchAttachShadow(): void {
+  if (!this._origAttachShadow) {
+    this._origAttachShadow = HTMLElement.prototype.attachShadow;
+    const self = this;
+
+    HTMLElement.prototype.attachShadow = function (init: ShadowRootInit) {
+      const root = self._origAttachShadow!.apply(this, [init]);
+      self.rootSet.add(root);
+      self._ensureCssFor(root);
+      self._retranslate();
+      return root;
+    };
+  }
+}
+```
+
+```ts
+// 原方法改为仅代理到新的注入逻辑
+private _injectMinimalCssOnce(): void {
+  this._ensureCssFor(document);
+}
+```
+
+```ts
+// 新增：在 Document 与各 ShadowRoot 中各自注入一次样式
+private _ensureCssFor(root: Document | ShadowRoot): void {
+  const has =
+    (root as Document | ShadowRoot).querySelector?.('style[data-kt-trans-css]') ||
+    (root instanceof Document && root.getElementById('kt-trans-css'));
+  if (has) return;
+
+  const css = `
+    ${this.setting.hostTag} {
+      display: block;
+      margin-top: 0.25em;
+      line-height: inherit;
+    }
+    ${this.setting.hostTag}[data-style="fuzzy"] {
+      filter: blur(0.2px);
+      opacity: 0.92;
+    }
+    ${this.setting.hostTag}[data-style="dashline"] {
+      border-top: 1px dashed currentColor;
+      padding-top: 0.25em;
+    }
+    .kt-term {
+      font-style: normal;
+      font-weight: 600;
+    }
+  `;
+
+  const style = document.createElement('style');
+  style.textContent = css;
+  style.setAttribute('data-kt-trans-css', '1');
+
+  if (root instanceof Document) {
+    style.id = 'kt-trans-css';
+    root.head.appendChild(style);
+  } else {
+    root.appendChild(style);
+  }
+}
+```
+
+```ts
+// 新增：将翻译文本与占位符安全合并为 DOM 片段，避免注入
+private _buildFragmentFromTranslated(text: string, keeps: string[]): DocumentFragment {
+  const frag = document.createDocumentFragment();
+  const re = /\[(\d+)\]/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) {
+      frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+    }
+    const idx = Number(m[1]);
+    const html = keeps[idx] ?? '';
+    if (html) {
+      const tpl = document.createElement('template');
+      tpl.innerHTML = html;
+      frag.appendChild(tpl.content.cloneNode(true));
+    } else {
+      // 占位符缺失时按普通文本处理，保证可恢复
+      frag.appendChild(document.createTextNode(m[0]));
+    }
+    last = re.lastIndex;
+  }
+
+  if (last < text.length) {
+    frag.appendChild(document.createTextNode(text.slice(last)));
+  }
+  return frag;
+}
+```
+
+---
+
+File: entrypoints/content.ts
+Change: `onMessage` 返回设置值不再是硬编码；`enable_translation` 异步初始化并保持消息通道；其余逻辑不变
+
+```ts
+browser.runtime.onMessage.addListener((message: Message, sender: any, sendResponse: any) => {
+  console.log('[LocalTranslator] Received message:', message);
+
+  switch (message.action) {
+    case 'check_translator': {
+      sendResponse({ available: 'Translator' in self });
+      return;
+    }
+
+    case 'get_settings': {
+      const r = (domTranslator as any)?.rule;
+      sendResponse({
+        settings: {
+          enabled: domTranslator !== null,
+          displayMode: r?.displayMode ?? 'overlay',
+          textStyle: r?.textStyle ?? 'fuzzy',
+          trigger: r?.trigger ?? 'scroll',
+        },
+      });
+      return;
+    }
+
+    case 'enable_translation': {
+      // 可能需要用户手势；即使失败也先注册 DOM 翻译，后续手势会触发翻译生效
+      createTranslator()
+        .catch(() => null)
+        .finally(() => {
+          if (!domTranslator) {
+            initDomTranslation();
+            console.log('[LocalTranslator] DOM translation enabled via popup');
+          }
+          sendResponse({ success: true, translatorReady: !!chromeTranslator });
+        });
+      return true; // 异步响应
+    }
+
+    case 'disable_translation': {
+      if (domTranslator) {
+        domTranslator.unregister();
+        domTranslator = null;
+        console.log('[LocalTranslator] DOM translation disabled via popup');
+      }
+      sendResponse({ success: true });
+      return;
+    }
+
+    case 'toggle_style': {
+      if (domTranslator) {
+        domTranslator.toggleStyle();
+        console.log('[LocalTranslator] Translation style toggled via popup');
+      }
+      sendResponse({ success: true });
+      return;
+    }
+
+    case 'change_display_mode': {
+      if (domTranslator && message.mode) {
+        domTranslator.updateRule({ displayMode: message.mode });
+        console.log('[LocalTranslator] Display mode changed to:', message.mode);
+      }
+      sendResponse({ success: true });
+      return;
+    }
+
+    case 'change_trigger': {
+      if (domTranslator && message.trigger) {
+        domTranslator.updateRule({ trigger: message.trigger });
+        console.log('[LocalTranslator] Trigger mode changed to:', message.trigger);
+      }
+      sendResponse({ success: true });
+      return;
+    }
+
+    default: {
+      sendResponse({ error: 'Unknown action' });
+      return;
+    }
+  }
+});
+```
+
+---
+
+File: entrypoints/background.ts
+Change: 修复 `browser` 未导入导致的 `ReferenceError`
+
+```ts
+import { browser } from 'wxt/browser';
+
+export default defineBackground(() => {
+  console.log('Hello background!', { id: browser.runtime.id });
+});
+```
+
+---
+
+File: entrypoints/popup/index.html
+Change: 修复 MV3 元数据，避免使用已废弃的 `browser_action`
+
+```html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Local Translator</title>
+    <meta name="manifest.type" content="action" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>
+```
+
+---
+
+File: entrypoints/popup/style.css
+Change: 移除会撑爆扩展 Popup 的全局样式（`body{min-height:100vh;display:flex;...}` 等），仅保留 Tailwind 引入
+
+```css
+@import "tailwindcss";
+```

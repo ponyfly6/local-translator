@@ -1,215 +1,405 @@
+import { DomTranslator } from '../lib/dom-translator';
+import { browser } from 'wxt/browser';
+import { storage } from '../lib/storage';
+
+// Message types for communication with popup
+interface Message {
+  action: string;
+  mode?: 'overlay' | 'replace';
+}
+
+// Check if Chrome version meets minimum requirement
+function isChromeVersionSupported(): boolean {
+  try {
+    const userAgent = navigator.userAgent;
+    const chromeMatch = userAgent.match(/Chrome\/(\d+)\./);
+    if (!chromeMatch) return false;
+    
+    const majorVersion = parseInt(chromeMatch[1], 10);
+    return majorVersion >= 138;
+  } catch {
+    return false;
+  }
+}
+
+// Get Chrome version for debugging
+function getChromeVersion(): string {
+  const match = navigator.userAgent.match(/Chrome\/([\d.]+)/);
+  return match ? match[1] : 'unknown';
+}
+
 export default defineContentScript({
   matches: ['<all_urls>'],
-  main() {
-    console.log('[LocalTranslator] Content script main() start');
-    if (!('Translator' in self)) {
-      console.warn('Translator API not available: requires Chrome ≥138 desktop');
+  async main() {
+    console.log('[LocalTranslator] Content script starting');
+    console.log('[LocalTranslator] Chrome version:', getChromeVersion());
+    
+    // Check Chrome version first
+    if (!isChromeVersionSupported()) {
+      console.warn('[LocalTranslator] Chrome version < 138, Translator API not supported');
       return;
-    } else {
-      console.log('[LocalTranslator] Translator API detected');
+    }
+    
+    if (!('Translator' in self)) {
+      console.warn('[LocalTranslator] Translator API not available despite Chrome ≥138');
+      console.warn('[LocalTranslator] Please enable the Experimental Translation API:');
+      console.warn('[LocalTranslator] 1. Go to chrome://flags');
+      console.warn('[LocalTranslator] 2. Search for "translation api"');
+      console.warn('[LocalTranslator] 3. Enable "Experimental Translation API"');
+      console.warn('[LocalTranslator] 4. Restart Chrome');
+      return;
     }
 
-    let translatorPromise: Promise<any> | null = null;
-    let tooltipElement: HTMLDivElement | null = null;
-    let activeRequestId = 0;
+    let chromeTranslator: any = null;
+    let creatingTranslator: Promise<any> | null = null;
+    let domTranslator: DomTranslator | null = null;
 
-    const getTranslator = () => {
-      if (!translatorPromise) {
-        console.log('[LocalTranslator] Creating Translator instance', {
-          sourceLanguage: 'en',
-          targetLanguage: 'zh-Hans',
-        });
-        translatorPromise = (self as any)
-          .Translator.create({
-            sourceLanguage: 'en',
-            targetLanguage: 'zh-Hans',
-          })
-          .then((t: any) => {
-            console.log('[LocalTranslator] Translator instance ready');
-            return t;
-          })
-          .catch((err: unknown) => {
-            console.warn('[LocalTranslator] Translator.create() failed', err);
-            translatorPromise = null;
-            throw err;
-          });
-      } else {
-        console.log('[LocalTranslator] Reusing existing Translator instance');
-      }
-      return translatorPromise;
-    };
-
-    const createTooltip = () => {
-      const tooltip = document.createElement('div');
-      tooltip.id = 'translation-tooltip';
-      tooltip.style.cssText = `
-        position: absolute;
-        background: #1a1a1a;
-        color: #fff;
-        padding: 8px 12px;
-        border-radius: 6px;
-        font-size: 14px;
-        line-height: 1.5;
-        max-width: 300px;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-        z-index: 999999;
-        display: none;
-        pointer-events: none;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      `;
-      document.body.appendChild(tooltip);
-      return tooltip;
-    };
-
-    const showTranslation = (text: string, x: number, y: number) => {
-      if (!tooltipElement) {
-        tooltipElement = createTooltip();
-      }
-      
-      tooltipElement.textContent = text;
-      tooltipElement.style.display = 'block';
-      
-      const rect = tooltipElement.getBoundingClientRect();
-      const viewportWidth = window.innerWidth;
-      const viewportHeight = window.innerHeight;
-      
-      let left = x;
-      let top = y + 10;
-      
-      if (left + rect.width > viewportWidth) {
-        left = viewportWidth - rect.width - 10;
-      }
-      
-      if (top + rect.height > viewportHeight) {
-        top = y - rect.height - 10;
-      }
-      
-      tooltipElement.style.left = `${left}px`;
-      tooltipElement.style.top = `${top}px`;
-      console.log('[LocalTranslator] Show translation tooltip', {
-        preview: text.slice(0, 80),
-        length: text.length,
-        left,
-        top,
+    // Create translator (must be called from a user gesture)
+    const createTranslator = async () => {
+      if (chromeTranslator || creatingTranslator) return creatingTranslator;
+      creatingTranslator = (self as any).Translator.create({
+        sourceLanguage: 'en',
+        targetLanguage: 'zh-Hans',
+      }).then((tr: any) => {
+        chromeTranslator = tr;
+        console.log('[LocalTranslator] Chrome Translator initialized');
+        return tr;
+      }).catch((err: any) => {
+        console.error('[LocalTranslator] Failed to create translator:', err);
+        throw err;
+      }).finally(() => {
+        creatingTranslator = null;
       });
+      return creatingTranslator;
     };
 
-    const hideTranslation = () => {
-      if (tooltipElement) {
-        tooltipElement.style.display = 'none';
+    // Translation function for DomTranslator
+    const translateText = async (text: string): Promise<string> => {
+      try {
+        if (!chromeTranslator) return '';
+        const result = await chromeTranslator.translate(text);
+        return result || '';
+      } catch (err) {
+        console.error('[LocalTranslator] Translation error:', err);
+        return '';
       }
-      // Avoid spamming on scroll; keep this low-verbosity.
-      console.log('[LocalTranslator] Hide translation tooltip');
     };
 
-    let selectionTimeout: ReturnType<typeof setTimeout> | null = null;
-
-    const isInEditable = (node: Node | null): boolean => {
-      let el: Node | null = node;
-      while (el) {
-        if (el instanceof Element) {
-          const tag = el.tagName;
-          if (
-            (el instanceof HTMLElement && el.isContentEditable) ||
-            tag === 'INPUT' ||
-            tag === 'TEXTAREA' ||
-            el.getAttribute('role') === 'textbox'
-          ) {
-            return true;
-          }
-        }
-        el = el.parentNode;
-      }
-      return false;
-    };
-
-    document.addEventListener('mouseup', async () => {
-      if (selectionTimeout) {
-        clearTimeout(selectionTimeout);
-      }
-
-      selectionTimeout = setTimeout(async () => {
-        const selection = window.getSelection();
-        const text = (selection?.toString() || '').trim();
-        console.log('[LocalTranslator] Mouseup selection', {
-          length: text.length,
-          preview: text.slice(0, 80),
-        });
+    // Initialize DOM translation for full page
+    const initDomTranslation = async (translateAll: boolean = false) => {
+      // Get stored settings
+      const storedSettings = await storage.getSettings();
+      // Configuration for DOM translation
+      const rule = {
+        // Target common content selectors
+        selector: [
+          'article',
+          'main',
+          '.content',
+          '.post-content',
+          '.entry-content',
+          '.article-body',
+          '.markdown-body',
+          '[role="article"]',
+          '.story-body',
+          '.post-body',
+          'section.content',
+          'p',
+          'h1',
+          'h2',
+          'h3',
+          'h4',
+          'h5',
+          'h6',
+          'li',
+          'td',
+          'th',
+          'blockquote',
+          'figcaption'
+        ].join('; '),
         
-        if (!text || text.length > 500) {
-          if (!text) console.log('[LocalTranslator] Skip: empty selection');
-          if (text.length > 500) console.log('[LocalTranslator] Skip: selection too long');
-          hideTranslation();
-          return;
-        }
+        // Preserve important elements
+        keepSelector: 'img; a; button; code; pre; input; textarea; video; iframe; svg',
+        
+        // Common technical terms to preserve
+        terms: [
+          'JavaScript,JavaScript',
+          'TypeScript,TypeScript',
+          'Node.js,Node.js',
+          'React,React',
+          'Vue,Vue',
+          'Angular,Angular',
+          'HTML,HTML',
+          'CSS,CSS',
+          'API,API',
+          'HTTP,HTTP',
+          'HTTPS,HTTPS',
+          'URL,URL',
+          'JSON,JSON',
+          'XML,XML',
+          'SQL,SQL',
+          'Git,Git',
+          'GitHub,GitHub',
+          'npm,npm',
+          'webpack,webpack',
+          'Docker,Docker',
+          'Kubernetes,Kubernetes',
+          'Python,Python',
+          'Java,Java',
+          'C++,C++',
+          'Go,Go',
+          'Rust,Rust',
+          'Linux,Linux',
+          'Windows,Windows',
+          'macOS,macOS',
+          'iOS,iOS',
+          'Android,Android'
+        ].join(';'),
+        
+        displayMode: storedSettings.displayMode,
+        trigger: translateAll ? 'open' as const : 'manual' as const,
+        textStyle: storedSettings.textStyle,
+        minLen: 10,
+        maxLen: 5000,
+        translateTitle: false,
+      };
 
-        const isEnglish = /^[\x20-\x7E]+$/.test(text) && /[A-Za-z]/.test(text);
-        if (!isEnglish) {
-          console.log('[LocalTranslator] Skip: not English-like text');
-          hideTranslation();
-          return;
-        }
+      const setting = {
+        hostTag: 'x-local-trans',
+        reflowDebounce: 500,
+        visibleThreshold: 0.1,
+        skipTags: [
+          'style', 'script', 'noscript', 'svg', 'img', 'video', 'audio',
+          'textarea', 'input', 'button', 'select', 'option', 'iframe',
+          'code', 'pre', 'x-local-trans'
+        ],
+      };
 
-        // Skip inside inputs, textareas, or contenteditable areas
-        const anchorNode = selection?.anchorNode ?? null;
-        if (isInEditable(anchorNode)) {
-          console.log('[LocalTranslator] Skip: selection inside editable element');
-          hideTranslation();
-          return;
-        }
-
-        try {
-          const requestId = ++activeRequestId;
-          console.log('[LocalTranslator] Request translate', { requestId });
-          const translator = await getTranslator();
-          const translation = await translator.translate(text);
-          console.log('[LocalTranslator] Translation success', {
-            requestId,
-            outputLength: String(translation ?? '').length,
-          });
-          
-          const range = selection?.getRangeAt(0);
-          const rect = range?.getBoundingClientRect();
-          
-          if (rect && requestId === activeRequestId) {
-            showTranslation(translation, rect.left + window.scrollX, rect.bottom + window.scrollY);
-          }
-        } catch (err) {
-          console.warn('Translation failed:', err);
-          hideTranslation();
-        }
-      }, 500);
-    }, { passive: true });
-
-    document.addEventListener('mousedown', () => {
-      hideTranslation();
-      if (selectionTimeout) {
-        clearTimeout(selectionTimeout);
+      if (domTranslator) {
+        domTranslator.unregister();
       }
-      activeRequestId++;
-      console.log('[LocalTranslator] Mousedown: reset active request');
-    });
-
-    document.addEventListener('scroll', () => {
-      hideTranslation();
-    }, { passive: true });
-
-    document.addEventListener('selectionchange', () => {
-      const sel = window.getSelection();
-      if (!sel || sel.isCollapsed || !sel.toString().trim()) {
-        hideTranslation();
-        activeRequestId++;
-        console.log('[LocalTranslator] Selection cleared: hide + reset');
-      }
-    }, { passive: true });
-
-    const cleanup = () => {
-      if (tooltipElement && tooltipElement.parentNode) {
-        tooltipElement.parentNode.removeChild(tooltipElement);
-        tooltipElement = null;
-      }
-      console.log('[LocalTranslator] Cleanup on pagehide');
+      
+      domTranslator = new DomTranslator(rule, setting, translateText);
+      domTranslator.register();
+      console.log('[LocalTranslator] DOM translation registered', translateAll ? '(translate all)' : '(manual mode)');
     };
-    window.addEventListener('pagehide', cleanup, { once: true });
+
+    // Cleanup on page hide
+    window.addEventListener('pagehide', () => {
+      if (domTranslator) {
+        domTranslator.unregister();
+        domTranslator = null;
+      }
+    }, { once: true });
+
+
+    // Handle click with modifier key for paragraph translation (one-shot, no observers)
+    document.addEventListener('click', async (e) => {
+      // Check if Option/Alt key is pressed
+      if (!e.altKey) return;
+      
+      // Prevent default behavior
+      e.preventDefault();
+      e.stopPropagation();
+      
+      // Find the closest translatable element
+      const target = e.target as HTMLElement;
+      const translatableSelectors = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'td', 'th', 'blockquote', 'figcaption', 'article', 'section', 'div'];
+      
+      let elementToTranslate: HTMLElement | null = null;
+      for (const selector of translatableSelectors) {
+        if (target.matches(selector)) {
+          elementToTranslate = target;
+          break;
+        }
+        const closest = target.closest(selector);
+        if (closest) {
+          elementToTranslate = closest as HTMLElement;
+          break;
+        }
+      }
+      
+      if (!elementToTranslate) return;
+      
+      // Ensure translator is ready
+      if (!chromeTranslator) {
+        try {
+          await createTranslator();
+        } catch (err) {
+          console.error('[LocalTranslator] Failed to create translator:', err);
+          return;
+        }
+      }
+      
+      // Check if element already has translation
+      const existingTranslation = elementToTranslate.querySelector('x-local-trans');
+      if (existingTranslation) {
+        // Remove translation if it exists
+        existingTranslation.remove();
+        console.log('[LocalTranslator] Removed translation');
+        return;
+      }
+      
+      // Create a temporary DomTranslator for one-shot translation
+      const tempRule = {
+        selector: '', // Direct node translation; selector unused
+        keepSelector: 'img; a; button; code; pre; input; textarea; video; iframe; svg',
+        displayMode: 'overlay' as const,
+        trigger: 'manual' as const,
+        textStyle: 'fuzzy' as const,
+        minLen: 1,
+        maxLen: 10000,
+        translateTitle: false,
+      };
+
+      const tempSetting = {
+        hostTag: 'x-local-trans',
+        reflowDebounce: 500,
+        visibleThreshold: 0.1,
+        skipTags: [
+          'style', 'script', 'noscript', 'svg', 'img', 'video', 'audio',
+          'textarea', 'input', 'button', 'select', 'option', 'iframe',
+          'code', 'pre', 'x-local-trans'
+        ],
+      };
+
+      // Perform one-shot translation without registering observers
+      const tempTranslator = new DomTranslator(tempRule, tempSetting, translateText);
+      await tempTranslator.translateElement(elementToTranslate);
+
+      console.log('[LocalTranslator] Translated paragraph on Alt+Click');
+    }, true);
+
+
+    console.log('[LocalTranslator] Content script initialized');
+    
+    // Auto-enable translation if stored setting is true
+    try {
+      const settings = await storage.getSettings();
+      if (settings.enabled) {
+        console.log('[LocalTranslator] Auto-enabling translation from stored settings');
+        // Initialize translator first
+        createTranslator()
+          .catch(() => {
+            console.log('[LocalTranslator] Initial translator creation failed, will retry on gesture');
+            return null;
+          })
+          .finally(() => {
+            // Initialize DOM translation in manual mode
+            initDomTranslation(false).then(() => {
+              console.log('[LocalTranslator] Translation auto-enabled');
+            });
+          });
+      }
+    } catch (error) {
+      console.error('[LocalTranslator] Failed to load settings:', error);
+    }
+
+    // Message handler for popup communication
+    browser.runtime.onMessage.addListener((message: Message, _sender: any, sendResponse: any) => {
+      console.log('[LocalTranslator] Received message:', message);
+      
+      switch (message.action) {
+        case 'check_translator': {
+          sendResponse({ 
+            available: 'Translator' in self,
+            chromeVersionSupported: isChromeVersionSupported(),
+            chromeVersion: getChromeVersion()
+          });
+          return;
+        }
+        
+        case 'get_settings': {
+          // Get settings from storage instead of from domTranslator
+          storage.getSettings().then((storedSettings) => {
+            sendResponse({
+              settings: {
+                enabled: domTranslator !== null,
+                displayMode: storedSettings.displayMode,
+                textStyle: storedSettings.textStyle,
+              },
+            });
+          });
+          return true; // Async response
+        }
+        
+        case 'enable_translation': {
+          // 可能需要用户手势；即使失败也先注册 DOM 翻译，后续手势会触发翻译生效
+          createTranslator()
+            .catch(() => {
+              console.log('[LocalTranslator] Translator creation failed, will retry on user gesture');
+              return null;
+            })
+            .finally(async () => {
+              // Initialize in manual mode (no auto-translate)
+              await initDomTranslation(false);
+              console.log('[LocalTranslator] Manual translation mode enabled via popup');
+              sendResponse({ 
+                success: true, 
+                translatorReady: !!chromeTranslator,
+                message: 'Hold Option/Alt and click to translate paragraphs'
+              });
+            });
+          return true; // 异步响应
+        }
+        
+        case 'disable_translation': {
+          if (domTranslator) {
+            domTranslator.unregister();
+            domTranslator = null;
+            console.log('[LocalTranslator] DOM translation disabled via popup');
+          }
+          sendResponse({ success: true });
+          return;
+        }
+        
+        case 'toggle_style': {
+          if (domTranslator) {
+            domTranslator.toggleStyle();
+            console.log('[LocalTranslator] Translation style toggled via popup');
+          }
+          sendResponse({ success: true });
+          return;
+        }
+        
+        case 'change_display_mode': {
+          if (domTranslator && message.mode) {
+            domTranslator.updateRule({ displayMode: message.mode });
+            console.log('[LocalTranslator] Display mode changed to:', message.mode);
+          }
+          sendResponse({ success: true });
+          return;
+        }
+        
+        case 'translate_all': {
+          // Translate all content on the page
+          createTranslator()
+            .catch(() => {
+              console.log('[LocalTranslator] Failed to create translator, trying anyway');
+              return null;
+            })
+            .finally(async () => {
+              // If domTranslator doesn't exist, create it first
+              if (!domTranslator) {
+                await initDomTranslation(false); // Initialize in manual mode
+              }
+              
+              // Now translate all collected targets
+              if (domTranslator) {
+                domTranslator.translateAll();
+                console.log('[LocalTranslator] Triggered translation of all content');
+              }
+              
+              sendResponse({ success: true, message: 'Translating all content...' });
+            });
+          return true; // Async response
+        }
+        
+        default: {
+          sendResponse({ error: 'Unknown action' });
+          return;
+        }
+      }
+    });
   },
 });

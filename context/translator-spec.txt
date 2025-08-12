@@ -1,0 +1,546 @@
+# 仅限“DOM 插入译文”功能的实现规范（与翻译API无关）
+
+## 1. 目标与范围
+
+* 目标：在任意网页上，将**选定 DOM 区域的可见文本**提取为原文串，交由外部 `translate(text)` 函数得到译文后，**把译文插回原页面**；原文可保留或被替换；支持动态页面与 Shadow DOM；可启停、可更改样式；可完全回滚。
+* 非目标：翻译 API、鉴权、调用限流、具体服务适配均不在本文范围，统一抽象为 `translate(text): Promise<string>`。
+
+---
+
+## 2. 术语与约定
+
+* **目标节点（Target Node）**：命中规则选择器、需要展示译文的元素。
+* **译文容器（Host）**：插在目标节点内部、包裹译文的自定义元素，标签名建议唯一前缀，例如：`<x-kt-trans>`。
+* **占位符（Placeholder）**：为保持子结构（图片/链接/交互控件）而在待翻译文本中放入的标记，形如 `[0] [1] ...`，译后再回填。
+* **规则（Rule）**：一组决定“选哪些 DOM、怎么抽取、何时渲染、如何展示”的配置。
+* **设置（Setting）**：跨规则共用的阈值与时序参数。
+
+---
+
+## 3. 配置模型（建议接口）
+
+```ts
+type Rule = {
+  // 选择器；分号分隔多条；支持 Shadow DOM 穿透语法： 'outer ::shadow:: inner'
+  selector: string;
+
+  // 保留结构： 'matchSelector ::shadow:: subSelector'（两段任取其一）
+  keepSelector?: string; // 例：'img, video; .keep-me ::shadow:: .subkeep'
+
+  // 术语替换：每行为 "pattern,replacement"；pattern 作为正则全文匹配
+  terms?: string;        // 例："Node.js,Node.js；foo,富"
+
+  // 展示模式：'overlay'=原文+译文并存（默认）；'replace'=只保留译文，需可回滚
+  displayMode?: 'overlay' | 'replace';
+
+  // 触发模式：'scroll' 可见即译（默认）；'open' 打开即译；'hover' 鼠标悬停或按键+悬停
+  trigger?: 'scroll' | 'open' | 'hover';
+
+  // 悬停触发的辅助键：'alt' | 'ctrl' | 'shift'（仅 trigger='hover' 时生效）
+  hoverKey?: 'alt' | 'ctrl' | 'shift';
+
+  // 文本长度阈值（占位清洗后生效）
+  minLen?: number;  // 默认 2
+  maxLen?: number;  // 默认 8000
+
+  // 附加内联样式：作用于目标节点与其父节点
+  selectStyle?: string; // 如 "position:relative;"
+  parentStyle?: string;
+
+  // 译文文本样式：'fuzzy' | 'dashline'
+  textStyle?: 'fuzzy' | 'dashline';
+
+  // 可选钩子：渲染开始/移除后的自定义逻辑（字符串函数体或回调）
+  onRenderStart?: (el: Element, rawText: string) => void;
+  onRemove?: (el: Element) => void;
+
+  // 可选：是否翻译 document.title
+  translateTitle?: boolean;
+};
+
+type Setting = {
+  // 重新扫描/重渲染的防抖间隔（ms）
+  reflowDebounce?: number; // 默认 300
+
+  // IntersectionObserver 阈值
+  visibleThreshold?: number; // 默认 0.1
+
+  // 需要跳过的标签名
+  skipTags?: string[]; // 默认: style,script,svg,img,video,audio,textarea,input,button,select,option,iframe...
+
+  // 译文容器标签名
+  hostTag?: string; // 默认 'x-kt-trans'
+};
+```
+
+---
+
+## 4. 生命周期（控制流）
+
+1. **构造**：`new DomTranslator(rule, setting, translateFn)`
+2. **注册**：`register()`
+
+   * （可选）注入最小 CSS（见 §9）
+   * 初次扫描目标节点（含 Shadow DOM），建立观察器
+   * 依据 `trigger`：滚动懒渲染 / 全量即译 / 悬停触发
+   * （可选）翻译 `document.title`
+3. **渲染**：目标节点进入可视或被触发 → `_render(node)`
+4. **规则变更**：`updateRule(partial)` → 触发**重译**（断开观察器 → 清理 → 重新注册）
+5. **卸载**：`unregister()`：删除 Host、恢复替换过的节点、断开观察器、还原标题
+
+---
+
+## 5. DOM 扫描与 Shadow DOM 支持
+
+### 5.1 选择器解析
+
+* `rule.selector` 允许多条：按 `;` 分割，逐条处理。
+* 单条选择器若包含 `' ::shadow:: '`，分为外层选择器与内层选择器：
+
+  * 先用外层选择器匹配普通 DOM；
+  * 对每个命中元素，如存在 `shadowRoot`，在其 `shadowRoot` 内用内层选择器递归匹配；
+* 否则，直接在当前根（document 或某个 shadowRoot）下 `querySelectorAll(selector)`。
+
+### 5.2 ShadowRoot 动态创建
+
+* 覆写 `HTMLElement.prototype.attachShadow`：
+
+  * 在调用原生 `attachShadow` 之后，**调度一次重扫**（防抖 `setting.reflowDebounce`）。
+* 记录所有已观察的根（`document` 与各个 `shadowRoot`）。
+
+---
+
+## 6. 目标节点集合与去重策略
+
+* 维护：
+
+  * `rootSet: Set<RootNode>`：所有扫描根。
+  * `targetMap: Map<Element, Cache>`：目标节点 → 缓存（见 §8）。
+* 去重：
+
+  * 对每条选择器，过滤掉**其子树内还能命中相同选择器**的父节点，只保留“最深命中”（避免嵌套重复渲染）。
+  * 跳过 `setting.skipTags` 与任何已经包含 Host 的节点。
+
+---
+
+## 7. 触发策略
+
+* **scroll（默认）**：`IntersectionObserver` 监听 `targetMap` 中的节点；当 `entry.isIntersecting === true`，执行 `_render(node)`，随后取消观察此节点。
+* **open**：扫描后即对全部命中节点执行 `_render(node)`。
+* **hover**：为每个目标节点绑定 `mouseenter`/`mouseleave`；如设置了 `hoverKey`，仅当按键按下时触发渲染。
+
+---
+
+## 8. 文本抽取、占位与去噪
+
+### 8.1 抽取流程
+
+1. `raw = node.innerText.trim()`（**不要**用 `textContent`，避免包含布局性换行噪声）
+2. 若 `displayMode='replace'`：缓存 `node.innerHTML` 以便回滚；否则缓存 `raw`。
+3. 调用 `onRenderStart?.(node, raw)`
+
+### 8.2 保留结构（占位）
+
+* 配置 `keepSelector`，语法与 `selector` 相同：`'matchSelector ::shadow:: subSelector'`
+
+  * 遍历 `node.childNodes`（仅一层）：
+
+    * 若 child 命中 `matchSelector`，或其后代命中 `subSelector`：
+
+      * 记录 `child.outerHTML` 到 `keeps[]`，在文本中放入 `"[{index}]"`。
+      * 对 `<img>` 元素，保留其当前 `width/height`（通过内联 style 固定），减少回流。
+    * 否则，累加 `child.textContent`。
+* 若 `keeps.length > 0`：
+
+  * 将产生的文本作为 `q`；若 `raw` 本身有大量 `\n`，用 `replaceAll('\n',' ')` 降噪。
+
+### 8.3 术语替换（可选）
+
+* `rule.terms` 每行 `"pattern,replacement"`：
+
+  * 用 `new RegExp(pattern,'g')` 扫描 `q`，匹配到的片段替换为新的占位 `"[{keeps.length}]"`，并把 `<i class="kt-term">replacement</i>` 推入 `keeps[]`。
+
+### 8.4 长度阈值
+
+* `clean = q.replace(/\[(\d+)\]/g,'').trim()`；
+* 若 `clean.length < minLen || clean.length > maxLen`：**跳过渲染**。
+
+---
+
+## 9. 译文容器（Host）与样式
+
+### 9.1 容器结构
+
+* 在目标节点末尾 `appendChild(document.createElement(setting.hostTag))`。
+* 为 Host 添加属性：
+
+  * `data-trans-id`: 随机 8 字符，用于弃用过期结果（见 §10）。
+  * `data-style`: `'fuzzy' | 'dashline'`，供 CSS 切换。
+
+### 9.2 最小 CSS（建议注入一次）
+
+```css
+x-kt-trans { display:block; margin-top: .25em; line-height:inherit; }
+x-kt-trans[data-style="fuzzy"]   { filter: blur(.2px); opacity:.92; }
+x-kt-trans[data-style="dashline"]{ border-top:1px dashed currentColor; padding-top:.25em; }
+.kt-term { font-style: normal; font-weight: 600; }
+```
+
+### 9.3 displayMode
+
+* `overlay`：Host 与原文并存；不修改原有内容。
+* `replace`：在渲染成功后，**将 `node.innerHTML = host.innerHTML`**，随后移除 Host；回滚时把之前缓存的 `innerHTML` 还原。
+
+> 注：`replace` 模式要避免破坏网站事件绑定，建议仅对纯文本容器使用。
+
+---
+
+## 10. 异步一致性与重复渲染防护
+
+* 每次 `_render(node)`：
+
+  * 生成 `transId`，写入 Host 的 `data-trans-id` 与 `targetMap.get(node).lastId = transId`。
+  * 保存 `targetMap.get(node).snapshot = raw`。
+
+* 外部完成翻译后回调 `applyTranslation(node, transId, translatedText)`：
+
+  * 若 `targetMap.get(node).lastId !== transId`，**丢弃**（节点文本已变更）。
+  * 否则：
+
+    * `finalHtml = translatedText.replace(/\[(\d+)\]/g, (_,i)=> keeps[i])`
+    * 写入 Host：`host.innerHTML = escapeAndWrap(finalHtml)`（注意 XSS，见 §14）
+    * 若 `displayMode='replace'`：进行替换操作（§9.3）
+
+* 若渲染前发现节点已有 Host：
+
+  * 取 `prevRaw = targetMap.get(node).snapshot`
+  * 若 `node.innerText.trim().startsWith(prevRaw)`：视为未变更，直接跳过；
+  * 否则移除旧 Host，继续渲染。
+
+---
+
+## 11. 观察器与重译
+
+* **可见性**：单一 `IntersectionObserver`（`threshold = setting.visibleThreshold`），渲染后 `unobserve(node)`。
+* **DOM 变更**：对所有 `rootSet` 注册 `MutationObserver({childList:true, subtree:true})`：
+
+  * 当新增节点的父节点**不在跳过名单**且新增节点非 `skipTags` 时，调度**重扫**（防抖）。
+* **Shadow Root**：在 `attachShadow` 覆写中，拿到新 `shadowRoot` 后加入 `rootSet`，并调度重扫。
+* **重扫**：断开所有观察器 → 清理 Host（仅 `overlay` 模式）→ 重新扫描与注册；`replace` 模式需先还原（依赖缓存）。
+
+---
+
+## 12. 公共方法（类接口草案）
+
+```ts
+class DomTranslator {
+  constructor(rule: Rule, setting: Setting, translate: (text:string)=>Promise<string>) {}
+
+  register(): void;
+  unregister(): void;
+
+  updateRule(patch: Partial<Rule>): void; // 内部触发重译
+  toggleStyle(): void;                    // fuzzy ↔ dashline
+
+  // 仅供外部使用的低阶接口（可选）
+  collectTargets(): Element[];            // 扫描并返回新命中
+  render(node: Element): void;            // 强制对单节点渲染（会复用 _render）
+}
+```
+
+---
+
+## 13. 文档标题（可选）
+
+* 若 `rule.translateTitle === true`：
+
+  * 记录 `this._origTitle = document.title`
+  * 翻译后设置：`document.title = translated + ' | ' + this._origTitle`
+* `unregister()` 时恢复原标题。
+
+---
+
+## 14. 安全性与健壮性
+
+* **XSS**：译文是外部输入。`finalHtml` 应当被安全处理：
+
+  * 将普通文本通过 `textContent` 写入文本节点；
+  * 对占位回填的 `keeps[]` 仅接受**来自本页**的 `outerHTML`；禁止把译文字符串原样插为 `innerHTML`。
+  * 若确需富文本展示，使用受信白名单的 `DOMPurify` 之类净化后写入。
+* **性能**：
+
+  * 懒渲染 + 防抖；去重到“最深节点”；跳过极短/极长文本；避免在离屏节点做翻译。
+* **可回滚**：
+
+  * `replace` 模式**必须**缓存 `node.innerHTML`；`unregister()` 统一恢复。
+* **事件保真**：
+
+  * `overlay` 优先，避免破坏框架绑定；`replace` 仅用于纯文本容器。
+* **样式冲突**：
+
+  * Host 使用自定义标签与前缀类名；`z-index` 尽量不介入（依赖流式布局），必要时设为 `auto`。
+
+---
+
+## 15. 端到端伪代码（省略翻译实现）
+
+```js
+class DomTranslator {
+  constructor(rule, setting, translate) {
+    this.rule = Object.assign({ trigger:'scroll', displayMode:'overlay', textStyle:'fuzzy', minLen:2, maxLen:8000 }, rule);
+    this.setting = Object.assign({ hostTag:'x-kt-trans', reflowDebounce:300, visibleThreshold:0.1,
+      skipTags:['style','script','svg','img','video','audio','textarea','input','button','select','option','iframe'] }, setting);
+    this.translate = translate;
+    this.rootSet = new Set();
+    this.targetMap = new Map(); // node -> { snapshot, htmlBackup, lastId }
+    this._patchAttachShadow();
+  }
+
+  register() {
+    this._injectMinimalCssOnce();
+    this._scanAll(document);
+    this._observeRoots();
+    if (this.rule.trigger === 'open') this.targetMap.forEach((_,n)=>this._render(n));
+    if (this.rule.translateTitle) this._translateTitle();
+  }
+
+  unregister() {
+    this.io && this.io.disconnect();
+    this.mo && this.mo.disconnect();
+    this._restoreAll();
+    this._restoreTitle();
+    this.rootSet.clear();
+    this.targetMap.clear();
+  }
+
+  updateRule(patch) { Object.assign(this.rule, patch); this._retranslate(); }
+  toggleStyle() {
+    const next = this.rule.textStyle === 'fuzzy' ? 'dashline' : 'fuzzy';
+    this.rule.textStyle = next;
+    document.querySelectorAll(this.setting.hostTag).forEach(h=>h.setAttribute('data-style', next));
+  }
+
+  _scanAll(root) {
+    this.rootSet.add(root);
+    this._collectTargets(root, this.rule.selector).forEach(n=>{
+      if (!this.targetMap.has(n)) {
+        this.targetMap.set(n, {});
+        if (this.rule.trigger === 'scroll') this._observeVisible(n);
+        else if (this.rule.trigger === 'hover') this._bindHover(n);
+      }
+    });
+    // 扫描现有 shadowRoots
+    root.querySelectorAll('*').forEach(el => el.shadowRoot && this._scanAll(el.shadowRoot));
+  }
+
+  _collectTargets(root, selectorSpec) {
+    const nodes = [];
+    selectorSpec.split(';').map(s=>s.trim()).filter(Boolean).forEach(sel=>{
+      if (sel.includes('::shadow::')) {
+        const [outer, inner] = sel.split('::shadow::').map(s=>s.trim());
+        root.querySelectorAll(outer).forEach(el=>{
+          if (el.shadowRoot) el.shadowRoot.querySelectorAll(inner).forEach(n=>nodes.push(n));
+        });
+      } else {
+        root.querySelectorAll(sel).forEach(n=>nodes.push(n));
+      }
+    });
+    const skip = new Set(this.setting.skipTags);
+    // 最深命中过滤与 host 去重
+    return nodes.filter(n=>{
+      if (skip.has(n.localName)) return false;
+      if (n.matches(this.setting.hostTag) || n.querySelector(this.setting.hostTag)) return false;
+      // 最深：若后代也命中 selector，则只保留后代；此处用“后扫剔父”的简单实现：
+      return !nodes.some(m => m !== n && n.contains(m));
+    });
+  }
+
+  _observeVisible(node) {
+    this.io = this.io || new IntersectionObserver(es=>{
+      es.forEach(e=>{ if (e.isIntersecting) { this.io.unobserve(e.target); this._render(e.target); } });
+    }, { threshold: this.setting.visibleThreshold });
+    this.io.observe(node);
+  }
+
+  _bindHover(node) {
+    const key = this.rule.hoverKey;
+    const onEnter = (ev)=>{
+      const ok = !key || ev[`${key}Key`];
+      if (ok) { node.removeEventListener('mouseenter', onEnter); node.removeEventListener('mouseleave', onLeave); this._render(node); }
+    };
+    const onLeave = ()=>{};
+    node.addEventListener('mouseenter', onEnter);
+    node.addEventListener('mouseleave', onLeave);
+  }
+
+  async _render(node) {
+    // 既有 Host 处理
+    const exist = node.querySelector(this.setting.hostTag);
+    if (exist) exist.remove();
+
+    const cache = this.targetMap.get(node) || {};
+    const raw = node.innerText.trim();
+    if (!raw) return;
+
+    if (this.rule.displayMode === 'replace' && !cache.htmlBackup) cache.htmlBackup = node.innerHTML;
+    cache.snapshot = raw; this.targetMap.set(node, cache);
+
+    this.rule.onRenderStart?.(node, raw);
+
+    // 保留结构与术语
+    const { q, keeps } = this._buildPlaceholders(node);
+    const cleanLen = q.replace(/\[(\d+)\]/g,'').trim().length;
+    if (cleanLen < (this.rule.minLen ?? 2) || cleanLen > (this.rule.maxLen ?? 8000)) return;
+
+    const host = document.createElement(this.setting.hostTag);
+    host.setAttribute('data-style', this.rule.textStyle || 'fuzzy');
+    node.appendChild(host);
+    const transId = Math.random().toString(36).slice(2,10);
+    cache.lastId = transId; this.targetMap.set(node, cache);
+
+    // 外部翻译（此处只示例组装与回填）
+    const txt = await this.translate(q).catch(()=>null);
+    if (!txt) { host.remove(); return; }
+    if (this.targetMap.get(node)?.lastId !== transId) { host.remove(); return; }
+
+    const html = txt.replace(/\[(\d+)\]/g, (_, i)=> keeps[Number(i)] ?? '');
+    // 安全写入：文本放 textNode，keeps 已来源于本页 outerHTML
+    host.innerHTML = ''; host.appendChild(document.createTextNode('')); // 防止空 host
+    host.insertAdjacentHTML('beforeend', html);
+
+    if (this.rule.displayMode === 'replace') {
+      node.innerHTML = host.innerHTML;
+      host.remove();
+    }
+  }
+
+  _buildPlaceholders(node) {
+    const keeps = [];
+    const [matchSel, subSel] = (this.rule.keepSelector || '').split('::shadow::').map(s=>s?.trim());
+    let text = '';
+    node.childNodes.forEach(child=>{
+      if (child.nodeType === 1) {
+        const el = /** @type {Element} */(child);
+        const hit = (matchSel && el.matches?.(matchSel)) || (subSel && el.querySelector?.(subSel));
+        if (hit) {
+          if (el.tagName === 'IMG') { el.style.width = el.width+'px'; el.style.height = el.height+'px'; }
+          text += `[${keeps.length}]`; keeps.push(el.outerHTML);
+        } else {
+          text += el.textContent ?? '';
+        }
+      } else {
+        text += child.textContent ?? '';
+      }
+    });
+
+    let q = text || node.innerText || '';
+    // 术语
+    (this.rule.terms || '').split(/\n|；|;/).map(s=>s.trim()).filter(Boolean).forEach(line=>{
+      const [pat, rep=''] = line.split(',').map(s=>s?.trim());
+      if (!pat) return;
+      const re = new RegExp(pat,'g');
+      q = q.replace(re, ()=>{ const ph = `[${keeps.length}]`; keeps.push(`<i class="kt-term">${rep}</i>`); return ph; });
+    });
+    // 清洗换行
+    if (q.includes('\n')) q = q.replaceAll('\n',' ');
+    return { q, keeps };
+  }
+
+  _observeRoots() {
+    this.mo = new MutationObserver(ms=>{
+      let needRescan = false;
+      for (const m of ms) {
+        if (m.addedNodes?.length && m.target?.nodeType === 1) { needRescan = true; break; }
+      }
+      if (needRescan) this._retranslate();
+    });
+    this.rootSet.forEach(r=> this.mo.observe(r, { childList:true, subtree:true }));
+  }
+
+  _retranslate = debounce(()=>{ this.unregister(); this.register(); }, this.setting.reflowDebounce || 300);
+
+  _restoreAll() {
+    this.targetMap.forEach((cache, node)=>{
+      const host = node.querySelector(this.setting.hostTag);
+      host && host.remove();
+      if (this.rule.displayMode === 'replace' && cache.htmlBackup) node.innerHTML = cache.htmlBackup;
+      this.rule.onRemove?.(node);
+    });
+  }
+
+  _patchAttachShadow() {
+    const native = HTMLElement.prototype.attachShadow;
+    const self = this;
+    HTMLElement.prototype.attachShadow = function(...args) {
+      const root = native.apply(this, args);
+      self.rootSet.add(root);
+      self._retranslate();
+      return root;
+    };
+  }
+
+  _injectMinimalCssOnce() {
+    if (document.getElementById('kt-trans-css')) return;
+    const css = `
+      ${this.setting.hostTag}{display:block;margin-top:.25em;line-height:inherit;}
+      ${this.setting.hostTag}[data-style="fuzzy"]{filter:blur(.2px);opacity:.92;}
+      ${this.setting.hostTag}[data-style="dashline"]{border-top:1px dashed currentColor;padding-top:.25em;}
+      .kt-term{font-style:normal;font-weight:600;}
+    `;
+    const style = document.createElement('style');
+    style.id = 'kt-trans-css'; style.textContent = css;
+    document.head.appendChild(style);
+  }
+
+  _translateTitle() {
+    if (this._origTitle) return;
+    this._origTitle = document.title;
+    this.translate(this._origTitle).then(t=>{
+      if (t) document.title = `${t} | ${this._origTitle}`;
+    });
+  }
+
+  _restoreTitle() {
+    if (this._origTitle != null) { document.title = this._origTitle; this._origTitle = null; }
+  }
+}
+
+// 小工具：防抖
+function debounce(fn, ms=200){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
+```
+
+---
+
+## 16. 集成指引（最小用法）
+
+```js
+// 假设已有 translate(text) 函数
+const rule = {
+  selector: 'article, .content ::shadow:: .entry', // 支持 Shadow 穿透
+  keepSelector: 'img, a, button',
+  displayMode: 'overlay',
+  trigger: 'scroll',
+  textStyle: 'fuzzy',
+  minLen: 4,
+  terms: 'JavaScript,JavaScript；Node.js,Node.js',
+  translateTitle: true,
+};
+const setting = { hostTag:'x-kt-trans' };
+
+const tr = new DomTranslator(rule, setting, translate);
+tr.register();
+
+// 后续可：tr.updateRule({textStyle:'dashline'}), tr.unregister()
+```
+
+---
+
+## 17. 测试要点清单
+
+* 正常页、单页应用（频繁 DOM 变更）、含 Web Components 的站点。
+* `overlay` 与 `replace` 模式下的回滚正确性。
+* 图片/链接/按钮等保留元素的布局不变（IMG 宽高固定）。
+* 懒渲染时，翻译完成后节点内容已变化的过期丢弃逻辑。
+* 悬停 + 按键触发的可用性。
+* XSS 安全（译文严格按文本写入，占位仅允许本页结构回填）。
+* 性能：十万节点页面，扫描 + 懒渲染的开销与卡顿评估。

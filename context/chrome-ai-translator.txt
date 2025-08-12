@@ -1,0 +1,32 @@
+// content.js (MV3 内容脚本，选中英文后弹出中文翻译)
+(() => {
+  if (!('Translator' in self)) {
+    console.warn('Translator API 不可用：需要 Chrome ≥138 桌面版'); // feature detect
+    return;
+  }
+
+  let translatorPromise = null;
+  const getTranslator = () => {
+    // 在用户手势（mouseup）回调里首次创建，满足 user activation 要求
+    if (!translatorPromise) {
+      translatorPromise = Translator.create({
+        sourceLanguage: 'en',
+        // 目标中文：BCP 47，简体用 zh-Hans；如需繁体改为 zh-Hant
+        targetLanguage: 'zh-Hans',
+      });
+    }
+    return translatorPromise;
+  };
+
+  document.addEventListener('mouseup', async () => {
+    const text = (window.getSelection()?.toString() || '').trim();
+    if (!text) return;
+    try {
+      const translator = await getTranslator();
+      const out = await translator.translate(text);
+      alert(out);
+    } catch (err) {
+      console.warn('翻译失败：', err);
+    }
+  }, { passive: true });
+})();
