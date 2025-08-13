@@ -1,6 +1,23 @@
-# Local Translator
+# Local Translator (Improved Version)
 
 A Chrome extension that provides on-device, privacy-focused translation using Chrome's built-in Translator API. Translate web pages instantly without sending data to external servers.
+
+## 🎉 本版本改进 / Improvements in This Version
+
+> **原项目**: [kaichen/local-translator](https://github.com/kaichen/local-translator)
+
+### 🐛 修复的问题 / Fixed Issues
+- **修复翻译内容消失问题**: 解决了翻译整个页面后翻译内容快速消失的问题
+- **提升翻译稳定性**: 改进了DOM监听机制，避免翻译过程中的无限循环
+- **增强用户体验**: 翻译内容现在能够稳定显示，不会意外消失
+
+### 🔧 技术改进 / Technical Improvements
+- 改进MutationObserver过滤逻辑，避免翻译内容触发重新扫描
+- 添加翻译状态标记（`data-translating`, `data-translation-stable`）
+- 增加2秒延迟机制，给翻译过程足够时间完成
+- 优化DOM变化检测，忽略翻译相关的元素变化
+
+---
 
 ## Features
 
@@ -26,7 +43,7 @@ A Chrome extension that provides on-device, privacy-focused translation using Ch
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/local-translator.git
+   git clone https://github.com/ponyfly6/local-translator.git
    cd local-translator
    ```
 
