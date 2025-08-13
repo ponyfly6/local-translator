@@ -251,28 +251,39 @@ export class DomTranslator {
   }
 
   private async _render(node: Element): Promise<void> {
-    // 清理所有旧的 host，避免重复渲染堆叠
-    node.querySelectorAll(this.setting.hostTag).forEach((h) => h.remove());
-    
-    const cache = this.targetMap.get(node) || {};
-    const raw = (node as HTMLElement).innerText?.trim() || '';
-    if (!raw) return;
-    
-    if (this.rule.displayMode === 'replace' && !cache.htmlBackup) {
-      cache.htmlBackup = node.innerHTML;
-    }
-    
-    this.rule.onRenderStart?.(node, raw);
-    
-    const { q, keeps } = this._buildPlaceholders(node);
-    const cleanLen = q.replace(/\[(\d+)\]/g, '').trim().length;
-    if (cleanLen < this.rule.minLen || cleanLen > this.rule.maxLen) {
+    // 检查是否已经在翻译中，避免重复翻译
+    if (node.hasAttribute('data-translating')) {
+      console.log('[DomTranslator] Node already being translated, skipping');
       return;
     }
     
-    const host = document.createElement(this.setting.hostTag);
-    host.setAttribute('data-style', this.rule.textStyle);
-    node.appendChild(host);
+    // 标记为翻译中
+    node.setAttribute('data-translating', 'true');
+    
+    try {
+      // 清理所有旧的 host，避免重复渲染堆叠
+      node.querySelectorAll(this.setting.hostTag).forEach((h) => h.remove());
+      
+      const cache = this.targetMap.get(node) || {};
+      const raw = (node as HTMLElement).innerText?.trim() || '';
+      if (!raw) return;
+      
+      if (this.rule.displayMode === 'replace' && !cache.htmlBackup) {
+        cache.htmlBackup = node.innerHTML;
+      }
+      
+      this.rule.onRenderStart?.(node, raw);
+      
+      const { q, keeps } = this._buildPlaceholders(node);
+      const cleanLen = q.replace(/\[(\d+)\]/g, '').trim().length;
+      if (cleanLen < this.rule.minLen || cleanLen > this.rule.maxLen) {
+        return;
+      }
+      
+      const host = document.createElement(this.setting.hostTag);
+      host.setAttribute('data-style', this.rule.textStyle);
+      host.setAttribute('data-translation-stable', 'true'); // 标记为稳定的翻译内容
+      node.appendChild(host);
     
     const transId = Math.random().toString(36).slice(2, 10);
     cache.lastId = transId;
@@ -303,6 +314,14 @@ export class DomTranslator {
     } catch (err) {
       console.warn('[DomTranslator] Translation failed:', err);
       host.remove();
+    } finally {
+      // 清理翻译中标记
+      node.removeAttribute('data-translating');
+    }
+    } catch (error) {
+      console.error('[DomTranslator] Render error:', error);
+      // 确保在出错时也清理标记
+      node.removeAttribute('data-translating');
     }
   }
 
@@ -367,6 +386,7 @@ export class DomTranslator {
     this.mo = new MutationObserver(mutations => {
       if (this._isUpdating) return;
       let needRescan = false;
+      
       for (const mutation of mutations) {
         if (mutation.type !== 'childList' || !mutation.addedNodes?.length) continue;
 
@@ -375,9 +395,22 @@ export class DomTranslator {
           if (meaningful) return;
           if (n.nodeType !== 1) return; // ignore text/comment
           const el = n as Element;
+          
+          // 忽略我们自己注入的内容
           if (el.id === 'kt-trans-css') return; // ignore our injected style
           if (el.matches?.(this.setting.hostTag)) return; // ignore our host tag
           if (el.querySelector?.(this.setting.hostTag)) return; // ignore descendants containing our host
+          if (el.closest?.(this.setting.hostTag)) return; // ignore if parent contains our host tag
+          if (el.hasAttribute?.('data-translation-stable')) return; // ignore stable translation content
+          
+          // 忽略在已翻译元素内部的变化
+          const targetElement = mutation.target as Element;
+          if (targetElement.matches?.(this.setting.hostTag)) return;
+          if (targetElement.closest?.(this.setting.hostTag)) return;
+          if (targetElement.querySelector?.(this.setting.hostTag)) return;
+          if (targetElement.hasAttribute?.('data-translating')) return; // ignore elements being translated
+          if (targetElement.hasAttribute?.('data-translation-stable')) return; // ignore stable content
+          
           meaningful = true;
         });
 
@@ -386,8 +419,15 @@ export class DomTranslator {
           break;
         }
       }
+      
       if (needRescan) {
-        this._retranslate();
+        // 使用更长的延迟，并检查是否真的需要重新扫描
+        setTimeout(() => {
+          if (!this._isUpdating) {
+            console.log('[DomTranslator] DOM changes detected, rescanning...');
+            this._retranslate();
+          }
+        }, 2000); // 2秒延迟，给翻译足够时间完成
       }
     });
     
